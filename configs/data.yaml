@@ -1,0 +1,22 @@
+# Data Configuration
+# Define which connectome dataset to use for training and analysis
+
+# Connectome dataset to load
+# Options: cook2019, witvliet2020_7, witvliet2020_8, white1986_whole, white1986_n2u, etc.
+dataset: cook2019
+
+# Functional calcium imaging data from HuggingFace
+functional:
+  # Source datasets to load (list)
+  # Available: Venkatachalam2024, Flavell2023, Leifer2023, Kato2015, Nichols2017, 
+  #            Nguyen2016, Schrodel2013, Skora2018, Uzel2022, Yemini2021, Kaplan2020, Atanas2023
+  source_datasets:
+    - "Venkatachalam2024"
+    - "Flavell2023"
+    - "Leifer2023"
+  
+  # Specific worms to load (null = all worms from source datasets)
+  worms: null  # e.g., ["worm9", "worm12"] to filter specific worms
+  
+  # Auto-filter neurons to match those in the loaded connectome
+  match_connectome: true

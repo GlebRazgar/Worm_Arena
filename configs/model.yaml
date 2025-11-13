@@ -1,0 +1,13 @@
+# Define architecture choices.
+
+# model_type: gnn
+# hidden_dim: 128
+# layers: 4
+# dropout: 0.1
+# activation: relu
+
+# # GNN-specific
+# gnn:
+#   conv: gat
+#   heads: 4
+#   readout: sum
