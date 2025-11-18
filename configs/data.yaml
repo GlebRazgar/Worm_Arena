@@ -11,8 +11,6 @@ functional:
   # Available: Venkatachalam2024, Flavell2023, Leifer2023, Kato2015, Nichols2017, 
   #            Nguyen2016, Schrodel2013, Skora2018, Uzel2022, Yemini2021, Kaplan2020, Atanas2023
   source_datasets:
-    - "Venkatachalam2024"
-    - "Flavell2023"
     - "Leifer2023"
   
   # Specific worms to load (null = all worms from source datasets)

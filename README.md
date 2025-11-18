@@ -10,6 +10,8 @@ Desired design: Build a GNN that takes the connectome graph structure and uses c
 
 ## Next Steps
 
+- [ ] Fix the applying baseline model to all 6k time-steps, not just 100.
+-  Read the Laifer paper
 - [ ] Implement functional data loader for calcium imaging data
 - [ ] Build GNN architecture for temporal prediction
 - [ ] Implement training pipeline

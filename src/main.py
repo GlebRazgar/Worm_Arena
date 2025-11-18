@@ -16,14 +16,15 @@ from tests.functional_vis import plot_sample_traces
 
 
 if __name__ == "__main__":
-    # Load connectome from config
+    
+    # Download & load connectome from config
     graph = load_connectome()
-    
     # Connectome visualization (comment out to disable)
-    plot_connectome(graph, plot_3d=False, output_dir="tests/plots")
+    # plot_connectome(graph, plot_3d=False, output_dir="tests/plots")
     
-    # Functional visualization (comment out to disable)
+    # Download functional data
     df = load_functional_data(connectome=graph, verbose=False)
-    plot_sample_traces(df, num_neurons=6, output_dir="tests/plots")
+    # Functional visualization 
+    # plot_sample_traces(df, num_neurons=6, output_dir="tests/plots")
     
     print("\n✓ Complete! Check tests/plots/ for visualizations.")

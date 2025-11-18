@@ -1,6 +1,6 @@
 """
 Functional Data Loader for C. elegans
-Config-driven loader for calcium imaging time series data
+Config-driven loader for calcium imaging time series data with automatic caching
 """
 
 from datasets import load_dataset
@@ -9,15 +9,41 @@ import numpy as np
 import torch
 import sys
 from pathlib import Path
+import hashlib
+import json
 
 # Add configs to path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from configs.config import get_config
 
+# Cache directory
+CACHE_DIR = Path(__file__).parent.parent.parent / "data" / "cache"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-def load_functional_data(source_datasets=None, worms=None, connectome=None, verbose=True):
+
+def _get_cache_key(source_datasets, worms, connectome_neurons):
+    """Generate unique cache key based on filter parameters"""
+    key_parts = {
+        'sources': sorted(source_datasets) if source_datasets else [],
+        'worms': sorted(worms) if worms else None,
+        'neurons': sorted(list(connectome_neurons)) if connectome_neurons else None
+    }
+    key_str = json.dumps(key_parts, sort_keys=True)
+    return hashlib.md5(key_str.encode()).hexdigest()[:12]
+
+
+def _get_cache_paths(cache_key):
+    """Get cache file paths for given key"""
+    return {
+        'parquet': CACHE_DIR / f"functional_{cache_key}.parquet",
+        'tensors': CACHE_DIR / f"functional_{cache_key}_tensors.pt",
+        'metadata': CACHE_DIR / f"functional_{cache_key}_meta.json"
+    }
+
+
+def load_functional_data(source_datasets=None, worms=None, connectome=None, verbose=True, use_cache=True):
     """
-    Load calcium imaging data from HuggingFace dataset.
+    Load calcium imaging data from HuggingFace dataset with automatic caching.
     
     Args:
         source_datasets: List of source dataset names to load. If None, uses config.
@@ -25,6 +51,7 @@ def load_functional_data(source_datasets=None, worms=None, connectome=None, verb
         worms: List of specific worm IDs to load. If None, loads all worms (or uses config).
         connectome: PyTorch Geometric graph object for neuron filtering. If None, uses config setting.
         verbose: Whether to print loading information
+        use_cache: Whether to use cached data if available
     
     Returns:
         pd.DataFrame: Filtered calcium imaging data with columns:
@@ -54,22 +81,50 @@ def load_functional_data(source_datasets=None, worms=None, connectome=None, verb
     
     match_connectome_flag = config.match_connectome if connectome is None else (connectome is not None)
     
+    # Get connectome neurons for cache key
+    connectome_neurons = set(connectome.node_label) if (match_connectome_flag and connectome is not None) else None
+    
+    # Check cache
+    if use_cache:
+        cache_key = _get_cache_key(source_datasets, worms, connectome_neurons)
+        cache_paths = _get_cache_paths(cache_key)
+        
+        if cache_paths['parquet'].exists():
+            if verbose:
+                print(f"Loading from cache: {cache_paths['parquet'].name}")
+            df_filtered = pd.read_parquet(cache_paths['parquet'])
+            
+            if verbose:
+                print(f"\nCached dataset:")
+                print(f"  Total samples: {len(df_filtered)}")
+                print(f"  Unique neurons: {df_filtered['neuron'].nunique()}")
+                print(f"  Unique worms: {df_filtered['worm'].nunique()}")
+                print(f"  Sources: {df_filtered['source_dataset'].unique().tolist()}")
+            
+            return df_filtered
+    
     if verbose:
         print(f"Loading functional data from {len(source_datasets)} source(s)...")
         print(f"  Sources: {source_datasets}")
     
     # Load dataset from HuggingFace
     ds = load_dataset("qsimeon/celegans_neural_data", split='train')
-    df = pd.DataFrame(ds)
+    
+    # OPTIMIZATION: Filter BEFORE converting to pandas (much faster!)
+    if verbose:
+        print(f"  Total samples in dataset: {len(ds)}")
+    
+    # Filter by source datasets using HuggingFace's filter method
+    def filter_by_source(example):
+        return example['source_dataset'] in source_datasets
+    
+    ds_filtered = ds.filter(filter_by_source, num_proc=1)
     
     if verbose:
-        print(f"  Total samples in dataset: {len(df)}")
+        print(f"  After source filter: {len(ds_filtered)} samples")
     
-    # Filter by source datasets
-    df_filtered = df[df['source_dataset'].isin(source_datasets)].copy()
-    
-    if verbose:
-        print(f"  After source filter: {len(df_filtered)} samples")
+    # Now convert to pandas (much smaller dataset)
+    df_filtered = pd.DataFrame(ds_filtered)
     
     # Filter by worms if specified
     if worms is not None:
@@ -92,17 +147,43 @@ def load_functional_data(source_datasets=None, worms=None, connectome=None, verb
         print(f"  Unique worms: {df_filtered['worm'].nunique()}")
         print(f"  Labeled neurons: {df_filtered['is_labeled_neuron'].sum()}")
     
+    # Save to cache
+    if use_cache:
+        cache_key = _get_cache_key(source_datasets, worms, connectome_neurons)
+        cache_paths = _get_cache_paths(cache_key)
+        
+        if verbose:
+            print(f"\nSaving to cache: {cache_paths['parquet'].name}")
+        
+        df_filtered.to_parquet(cache_paths['parquet'], compression='snappy')
+        
+        # Save metadata
+        metadata = {
+            'source_datasets': source_datasets,
+            'worms': worms,
+            'num_samples': len(df_filtered),
+            'num_neurons': int(df_filtered['neuron'].nunique()),
+            'num_worms': int(df_filtered['worm'].nunique()),
+            'has_connectome_filter': connectome_neurons is not None
+        }
+        with open(cache_paths['metadata'], 'w') as f:
+            json.dump(metadata, f, indent=2)
+    
     return df_filtered
 
 
-def dataframe_to_tensors(df, sequence_column='original_calcium_data', time_column='original_time_in_seconds'):
+def dataframe_to_tensors(df, sequence_column='original_calcium_data', time_column='original_time_in_seconds', 
+                         use_cache=True, cache_key=None, verbose=False):
     """
-    Convert functional DataFrame to PyTorch tensors for GNN training.
+    Convert functional DataFrame to PyTorch tensors for GNN training with caching.
     
     Args:
         df: DataFrame from load_functional_data()
         sequence_column: Column name containing calcium time series
         time_column: Column name containing time points
+        use_cache: Whether to use cached tensors if available
+        cache_key: Optional cache key (auto-generated if None)
+        verbose: Print loading information
     
     Returns:
         dict containing:
@@ -114,7 +195,26 @@ def dataframe_to_tensors(df, sequence_column='original_calcium_data', time_colum
             - source_datasets: list of str - Source dataset names
             - lengths: torch.Tensor [num_samples] - Actual sequence lengths
             - neuron_to_idx: dict - Mapping from neuron name to unique index
+            - unique_neurons: list of str - Sorted unique neuron names
     """
+    # Generate cache key if not provided
+    if cache_key is None and use_cache:
+        # Use simple hash of dataframe shape and content
+        source_datasets = df['source_dataset'].unique().tolist()
+        worms = df['worm'].unique().tolist() if len(df['worm'].unique()) < 200 else None
+        neurons = sorted(df['neuron'].unique().tolist())
+        cache_key = _get_cache_key(source_datasets, worms, set(neurons))
+    
+    # Check tensor cache
+    if use_cache and cache_key:
+        cache_paths = _get_cache_paths(cache_key)
+        if cache_paths['tensors'].exists():
+            if verbose:
+                print(f"Loading tensors from cache: {cache_paths['tensors'].name}")
+            return torch.load(cache_paths['tensors'])
+    
+    if verbose:
+        print("Converting DataFrame to tensors...")
     if len(df) == 0:
         raise ValueError("Cannot convert empty DataFrame to tensors")
     
@@ -162,6 +262,13 @@ def dataframe_to_tensors(df, sequence_column='original_calcium_data', time_colum
     
     if time_array is not None:
         result['time'] = torch.from_numpy(time_array)
+    
+    # Save tensor cache
+    if use_cache and cache_key:
+        cache_paths = _get_cache_paths(cache_key)
+        if verbose:
+            print(f"Saving tensors to cache: {cache_paths['tensors'].name}")
+        torch.save(result, cache_paths['tensors'])
     
     return result
 
