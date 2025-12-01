@@ -1,5 +1,13 @@
 # Define architecture choices.
 
+# Simple GCN Test Model
+simple_gcn:
+  hidden_dim: 32
+  epochs: 100
+  batch_size: 32
+  lr: 0.001
+
+# Full GNN-LSTM Model (for future use)
 # model_type: gnn
 # hidden_dim: 128
 # layers: 4

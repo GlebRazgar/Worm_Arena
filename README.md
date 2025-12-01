@@ -1,7 +1,6 @@
-# Worm Arena
+# Worm Arena / WromFunctionator  / Struc2Func
 
-A C. elegans simulation framework that uses connectome graphs and single-neuron calcium functional data to train a Graph Neural Network (GNN) for predicting neuronal activation at the next time-step.
-
+A C. elegans simulation framework building structure 2 function computational models.
 
 
 ## Goal:

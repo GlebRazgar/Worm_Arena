@@ -12,3 +12,7 @@ data/cache/*.pt
 data/cache/*_meta.json
 
 !data/cache/README.md
+
+# folders
+checkpoints
+
