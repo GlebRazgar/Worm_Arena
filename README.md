@@ -8,12 +8,10 @@ A C. elegans simulation framework building structure 2 function computational mo
 Desired design: Build a GNN that takes the connectome graph structure and uses calcium activity to predict neuronal activation for the next time-step.
 
 ## Next Steps
-
-- [ ] Fix the applying baseline model to all 6k time-steps, not just 100.
--  Read the Laifer paper
-- [ ] Implement functional data loader for calcium imaging data
-- [ ] Build GNN architecture for temporal prediction
-- [ ] Implement training pipeline
+- [ ] Sift through different signal processing approaches. Select one and implement it. (Spike vs gradient learning)
+- [ ] Choose the best output metric (MSE? EMSE? explained variance)
+- [ ] GCN → GAT. Implement the graph attention network.
+- [ ] Compare two GATs: A trained on just funcitonal, with no structural priors and B with structural priors. 
 - [ ] Add evaluation metrics
 - [ ] Integrate body simulation
 
@@ -89,70 +87,6 @@ This will:
   - `connectome-{dataset}.png` - Connectome structure
   - `functional_..._diverse_traces.png` - Calcium traces from different recordings
 
-Both visualizations are simple one-liners that can be easily commented out in `src/main.py`
-
-### Using the Connectome Loader
-
-```python
-from data.connectomes.connectome_loader import load_connectome
-
-# Load from config (uses configs/data.yaml)
-graph = load_connectome()
-
-# Or specify directly
-graph = load_connectome('witvliet2020_7')
-
-# Access graph properties
-print(f"Dataset: {graph.connectome_name}")
-print(f"Nodes: {graph.num_nodes}")
-print(f"Edges: {graph.num_edges}")
-print(f"Node features: {graph.x.shape}")
-print(f"Edge features: {graph.edge_attr.shape}")  # [gap_junction, chemical_synapse]
-print(f"3D positions: {graph.pos.shape}")
-```
-
-### Using the Functional Data Loader
-
-```python
-from data.functional.functional_loader import load_functional_data, dataframe_to_tensors
-from data.connectomes.connectome_loader import load_connectome
-
-# Load connectome
-graph = load_connectome()
-
-# Load functional data (auto-matches to connectome neurons)
-df = load_functional_data(connectome=graph)
-
-print(f"Samples: {len(df)}")
-print(f"Neurons: {df['neuron'].nunique()}")
-print(f"Worms: {df['worm'].nunique()}")
-
-# Convert to PyTorch tensors for training
-tensors = dataframe_to_tensors(df)
-print(f"Data shape: {tensors['data'].shape}")  # [num_samples, seq_len]
-print(f"Mask shape: {tensors['mask'].shape}")  # Padding mask
-```
-
-Run visualization scripts:
-```bash
-cd tests
-python connectome_vis.py  # Visualize connectome structure
-python functional_vis.py   # Visualize calcium imaging data
-```
-
-### Visualizing the Connectome
-
-```python
-from tests.visualisation import plot_connectome
-
-# Auto-generates filenames with connectome name
-plot_connectome(graph, plot_3d=False, output_dir="plots")
-plot_connectome(graph, plot_3d=True, output_dir="plots")
-
-# Or specify custom filename
-plot_connectome(graph, filename="custom_name.png")
-```
-
 ## Switching Connectomes
 
 To use a different connectome, simply edit `configs/data.yaml`:
@@ -170,7 +104,7 @@ Available connectomes:
 - `white1986_n2u` - White et al. 1986 N2U
 - `white1986_jsh` - White et al. 1986 JSH
 
-Then run `python src/main.py` and the visualization will automatically use the new dataset with appropriate naming!
+Then run `python src/main.py` and the visualization will automatically use the new dataset.
 
 ## Dataset Information
 
@@ -191,11 +125,3 @@ Then run `python src/main.py` and the visualization will automatically use the n
 - **12 source datasets** aggregated and standardized
 - **Preprocessed**: Resampled (0.333s), smoothed, normalized
 - **Labeled neurons**: Quality-controlled neuron identification
-
-**Citation**:
-```
-Q. Simeon, L. Venâncio, M. A. Skuhersky, A. Nayebi, E. S. Boyden and G. R. Yang, 
-"Scaling Properties for Artificial Neural Network Models of a Small Nervous System," 
-SoutheastCon 2024, Atlanta, GA, USA, 2024, pp. 516-524, 
-doi: 10.1109/SoutheastCon52093.2024.10500049.
-```
