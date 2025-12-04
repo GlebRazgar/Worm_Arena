@@ -18,11 +18,24 @@ import time
 import json
 import yaml
 
+import random
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
+
+
+def set_seed(seed=42):
+    """Set random seeds for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if torch.backends.mps.is_available():
+        torch.mps.manual_seed(seed)
 
 # Optional: Weights & Biases
 try:
@@ -255,6 +268,9 @@ def train_gat_model(args):
     Main training function for GAT-LSTM model.
     OPTIMIZED for M4 Max with limited memory.
     """
+    # Set seeds for reproducibility
+    set_seed(42)
+    
     print("=" * 70)
     print("GAT-LSTM MODEL TRAINING (OPTIMIZED)")
     print("=" * 70)
@@ -309,7 +325,10 @@ def train_gat_model(args):
     
     # Create loaders with optimized settings
     # Use larger batch size for validation (no gradients needed)
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=False)
+    # Use generator for reproducible shuffling
+    g = torch.Generator()
+    g.manual_seed(42)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=False, generator=g)
     val_loader = DataLoader(val_ds, batch_size=batch_size * 2, shuffle=False, num_workers=0, pin_memory=False)
     test_loader = DataLoader(test_ds, batch_size=batch_size * 2, shuffle=False, num_workers=0, pin_memory=False)
     

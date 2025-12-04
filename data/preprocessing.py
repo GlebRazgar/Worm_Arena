@@ -232,8 +232,8 @@ class WormGraphDataset(Dataset):
         """
         np.random.seed(seed)
         
-        # Get unique worms
-        worms = list(set(d.worm_id for d in self.data_list))
+        # Get unique worms - SORTED for reproducibility (set ordering is non-deterministic)
+        worms = sorted(set(d.worm_id for d in self.data_list))
         np.random.shuffle(worms)
         
         n_worms = len(worms)
