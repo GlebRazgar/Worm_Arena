@@ -1,8 +1,6 @@
 <!-- 74d393d4-accd-4320-a4d6-e9aa0cea017a ff0f296d-c07a-4ff2-bd81-2a774a7a227f -->
 # Simple GCN Test Model Architecture Plan
 
-
-
 ````javascript
 
 **Specific Goals**:
@@ -165,8 +163,6 @@ loss = mean((x̂_{t+1} - y_{t+1})²) where mask == 1
 4. ✅ Model can learn from data (loss decreases)
 5. ✅ Pipeline is ready for complex models
 ````
-
-
 
 ## 1. Goal
 

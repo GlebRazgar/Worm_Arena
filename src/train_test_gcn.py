@@ -22,8 +22,9 @@ from data.connectomes.connectome_loader import load_connectome
 from data.functional.functional_loader import load_functional_data
 from data.preprocessing import load_or_create_dataset
 from models.test_gcn import SimpleTestGCN, masked_mse_loss, evaluate, compute_naive_baseline
-from models.gcn_lstm import GCNLSTM
-from models.gcn_lstm_advanced import AdvancedGCNLSTM
+# DISABLED: GCN-LSTM for now
+# from models.gcn_lstm import GCNLSTM
+# from models.gcn_lstm_advanced import AdvancedGCNLSTM
 
 
 def setup_device():
@@ -105,10 +106,13 @@ def train_model(args):
     print(f"\n2. Creating graph-temporal dataset...")
     t0 = time.time()
     
+    # SimpleTestGCN only works with window_size=1 (single timestep input)
+    # Force window_size=1 regardless of args
     dataset = load_or_create_dataset(
         df, connectome, 
         max_worms=args.max_worms,
-        window_size=args.window_size,
+        window_size=1,  # Always use 1 for SimpleTestGCN
+        target_horizon=1,  # Always train on t+1
         use_cache=True, 
         verbose=True
     )
@@ -154,51 +158,47 @@ def train_model(args):
     
     # Initialize model
     print(f"\n4. Initializing model...")
-    if args.advanced:
-        # Use advanced model with all improvements
-        model = AdvancedGCNLSTM(
-            num_gcn_layers=args.num_gcn_layers,
-            hidden_dim=args.hidden_dim,
-            lstm_hidden=args.lstm_hidden,
-            num_lstm_layers=args.num_lstm_layers,
-            window_size=args.window_size,
-            dropout=args.dropout,
-            edge_dim=2  # gap + chem weights
-        )
-        model_name = "AdvancedGCN-LSTM"
-    elif args.window_size > 1:
-        model = GCNLSTM(
-            hidden_dim=args.hidden_dim,
-            lstm_hidden=args.lstm_hidden,
-            num_lstm_layers=args.num_lstm_layers,
-            window_size=args.window_size,
-            dropout=args.dropout
-        )
-        model_name = "GCN-LSTM"
-    else:
-        model = SimpleTestGCN(hidden_dim=args.hidden_dim)
-        model_name = "SimpleTestGCN"
+    # DISABLED: GCN-LSTM for now (not working yet)
+    # Only use SimpleTestGCN
+    model = SimpleTestGCN(hidden_dim=args.hidden_dim)
+    model_name = "SimpleTestGCN"
+    
+    # Generate model-specific weight filename
+    def get_weight_filename(model_name):
+        """Convert model name to weight filename."""
+        # Convert to lowercase and replace common patterns
+        name = model_name.lower()
+        # Handle specific cases
+        if "gcn" in name and "lstm" in name:
+            if "advanced" in name:
+                return "advanced_gcn_lstm_model_weights.pt"
+            return "gcn_lstm_model_weights.pt"
+        elif "gcn" in name:
+            return "gcn_model_weights.pt"
+        elif "gat" in name:
+            return "gat_model_weights.pt"
+        elif "lstm" in name:
+            return "lstm_model_weights.pt"
+        else:
+            # Generic fallback
+            return f"{name.lower().replace(' ', '_')}_model_weights.pt"
+    
+    weight_filename = get_weight_filename(model_name)
     
     model = model.to(device)
     
+    # DISABLED: torch.compile() causes shape inference issues with temporal windows
     # MPS Optimization: Compile model for better GPU utilization
-    if device.type == 'mps' and hasattr(torch, 'compile'):
-        try:
-            print(f"   Compiling model for MPS acceleration...")
-            model = torch.compile(model, mode='reduce-overhead')
-            print(f"   ✓ Model compiled for MPS")
-        except Exception as e:
-            print(f"   ⚠ Compilation failed (using eager mode): {e}")
+    # if device.type == 'mps' and hasattr(torch, 'compile'):
+    #     try:
+    #         print(f"   Compiling model for MPS acceleration...")
+    #         model = torch.compile(model, mode='reduce-overhead')
+    #         print(f"   ✓ Model compiled for MPS")
+    #     except Exception as e:
+    #         print(f"   ⚠ Compilation failed (using eager mode): {e}")
     
     print(f"   {model_name} with {model.num_params} parameters")
     print(f"   Hidden dim: {args.hidden_dim}")
-    if args.window_size > 1:
-        print(f"   Window size: {args.window_size}")
-        print(f"   LSTM hidden: {args.lstm_hidden}, Layers: {args.num_lstm_layers}")
-        if args.advanced:
-            print(f"   GCN layers: {args.num_gcn_layers}")
-            print(f"   Bidirectional LSTM: Yes")
-            print(f"   Edge-gated GCN: Yes")
     
     # Optimizer
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
@@ -220,6 +220,10 @@ def train_model(args):
     
     checkpoint_dir = Path(__file__).parent.parent / "models" / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Weights directory (save after each epoch)
+    weights_dir = Path(__file__).parent.parent / "models" / "weights"
+    weights_dir.mkdir(parents=True, exist_ok=True)
     
     t_start = time.time()
     
@@ -267,6 +271,9 @@ def train_model(args):
                 'val_r2': val_r2,
             }, checkpoint_dir / "simple_gcn_best.pt")
         
+        # Save weights after each epoch (overwrite previous)
+        torch.save(model.state_dict(), weights_dir / weight_filename)
+        
         # Update epoch progress bar
         epoch_pbar.set_postfix({
             'train': f'{train_loss:.4f}',
@@ -291,6 +298,7 @@ def train_model(args):
     print(f"   Training complete in {total_time:.1f}s ({total_time/60:.1f} min)")
     print(f"   Average epoch time: {avg_epoch_time:.1f}s")
     print(f"   Best validation loss: {best_val_loss:.6f} at epoch {best_epoch + 1}")
+    print(f"   Final weights saved to: {weights_dir / weight_filename}")
     
     # Load best model for final evaluation
     print(f"\n7. Final evaluation on test set...")

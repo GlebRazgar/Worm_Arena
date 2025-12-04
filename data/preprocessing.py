@@ -99,7 +99,7 @@ def align_worm_timesteps(worm_df, neuron_list, time_step=0.333):
     return matrix, mask, timestamps
 
 
-def create_graph_temporal_dataset(df, connectome, max_worms=None, window_size=1, verbose=True):
+def create_graph_temporal_dataset(df, connectome, max_worms=None, window_size=1, target_horizon=1, verbose=True):
     """
     Create graph-temporal dataset from functional data and connectome.
     
@@ -108,6 +108,7 @@ def create_graph_temporal_dataset(df, connectome, max_worms=None, window_size=1,
         connectome: PyTorch Geometric graph from load_connectome()
         max_worms: Maximum number of worms to process (None=all)
         window_size: Number of timesteps to use as input (1=single timestep, >1=temporal window)
+        target_horizon: How many steps ahead to predict (1=t+1, 10=t+10, etc.)
         verbose: Print progress
     
     Returns:
@@ -153,8 +154,8 @@ def create_graph_temporal_dataset(df, connectome, max_worms=None, window_size=1,
         
         T = matrix.shape[0]
         
-        # Create (X_window, X_{t+1}) pairs
-        for t in range(window_size - 1, T - 1):
+        # Create (X_window, X_{t+target_horizon}) pairs
+        for t in range(window_size - 1, T - target_horizon):
             # Create temporal window: [t-window_size+1, t] (inclusive)
             if window_size == 1:
                 x_window = torch.tensor(matrix[t], dtype=torch.float32).unsqueeze(-1)  # [N, 1]
@@ -171,8 +172,8 @@ def create_graph_temporal_dataset(df, connectome, max_worms=None, window_size=1,
                 # Combined mask: all timesteps in window must be valid
                 mask_window = mask_window.prod(dim=1, keepdim=True)  # [N, 1]
             
-            y_t = torch.tensor(matrix[t + 1], dtype=torch.float32).unsqueeze(-1)  # [N, 1]
-            mask_next = torch.tensor(mask[t + 1], dtype=torch.float32).unsqueeze(-1)  # [N, 1]
+            y_t = torch.tensor(matrix[t + target_horizon], dtype=torch.float32).unsqueeze(-1)  # [N, 1]
+            mask_next = torch.tensor(mask[t + target_horizon], dtype=torch.float32).unsqueeze(-1)  # [N, 1]
             
             # Combined mask: window and next timestep must be valid
             combined_mask = mask_window * mask_next
@@ -184,13 +185,14 @@ def create_graph_temporal_dataset(df, connectome, max_worms=None, window_size=1,
             data = Data(
                 x=x_window,
                 edge_index=edge_index,
-                edge_attr=edge_attr,  # Include edge attributes
+                edge_attr=edge_attr,
                 mask=combined_mask,
                 y=y_t,
                 worm_id=worm_id,
                 timestep=t,
                 num_nodes=N,
-                window_size=window_size
+                window_size=window_size,
+                target_horizon=target_horizon
             )
             all_data.append(data)
             total_samples += 1
@@ -223,6 +225,7 @@ class WormGraphDataset(Dataset):
     def split_by_worm(self, train_ratio=0.8, val_ratio=0.1, seed=42):
         """
         Split dataset by worm ID (not by sample) to avoid data leakage.
+        Ensures at least 1 worm in each split when possible.
         
         Returns:
             train_dataset, val_dataset, test_dataset
@@ -233,9 +236,20 @@ class WormGraphDataset(Dataset):
         worms = list(set(d.worm_id for d in self.data_list))
         np.random.shuffle(worms)
         
-        # Split worms
-        n_train = int(len(worms) * train_ratio)
-        n_val = int(len(worms) * val_ratio)
+        n_worms = len(worms)
+        
+        # Handle small datasets: ensure at least 1 worm in val/test if possible
+        if n_worms >= 3:
+            # At least 1 worm in each split
+            n_val = max(1, int(n_worms * val_ratio))
+            n_test = max(1, int(n_worms * (1 - train_ratio - val_ratio)))
+            n_train = n_worms - n_val - n_test
+        elif n_worms == 2:
+            # 1 train, 0 val, 1 test
+            n_train, n_val, n_test = 1, 0, 1
+        else:
+            # Only 1 worm: use all for training
+            n_train, n_val, n_test = 1, 0, 0
         
         train_worms = set(worms[:n_train])
         val_worms = set(worms[n_train:n_train + n_val])
@@ -249,19 +263,20 @@ class WormGraphDataset(Dataset):
         return WormGraphDataset(train_data), WormGraphDataset(val_data), WormGraphDataset(test_data)
 
 
-def get_cache_path(source_datasets, max_worms, window_size):
+def get_cache_path(source_datasets, max_worms, window_size, target_horizon):
     """Generate cache path for preprocessed dataset."""
     key_parts = {
         'sources': sorted(source_datasets) if source_datasets else [],
         'max_worms': max_worms,
-        'window_size': window_size
+        'window_size': window_size,
+        'target_horizon': target_horizon
     }
     key_str = json.dumps(key_parts, sort_keys=True)
     cache_key = hashlib.md5(key_str.encode()).hexdigest()[:12]
     return CACHE_DIR / f"graph_windows_{cache_key}.pt"
 
 
-def load_or_create_dataset(df, connectome, max_worms=None, window_size=1, use_cache=True, verbose=True):
+def load_or_create_dataset(df, connectome, max_worms=None, window_size=1, target_horizon=1, use_cache=True, verbose=True):
     """
     Load cached dataset or create new one.
     
@@ -270,6 +285,7 @@ def load_or_create_dataset(df, connectome, max_worms=None, window_size=1, use_ca
         connectome: PyTorch Geometric graph
         max_worms: Maximum worms to process
         window_size: Temporal window size (1=single timestep, >1=window)
+        target_horizon: Prediction horizon (1=t+1, 10=t+10, etc.)
         use_cache: Whether to use caching
         verbose: Print progress
     
@@ -277,7 +293,7 @@ def load_or_create_dataset(df, connectome, max_worms=None, window_size=1, use_ca
         WormGraphDataset
     """
     source_datasets = df['source_dataset'].unique().tolist()
-    cache_path = get_cache_path(source_datasets, max_worms, window_size)
+    cache_path = get_cache_path(source_datasets, max_worms, window_size, target_horizon)
     
     if use_cache and cache_path.exists():
         if verbose:
@@ -286,7 +302,7 @@ def load_or_create_dataset(df, connectome, max_worms=None, window_size=1, use_ca
         return WormGraphDataset(data_list)
     
     # Create dataset
-    data_list = create_graph_temporal_dataset(df, connectome, max_worms, window_size, verbose)
+    data_list = create_graph_temporal_dataset(df, connectome, max_worms, window_size, target_horizon, verbose)
     
     # Cache
     if use_cache and len(data_list) > 0:

@@ -5,14 +5,21 @@ __pycache__/
 *.pyd
 
 # OS files
-.DS_Storedata/cache/
+.DS_Store
 
+# Data cache
+data/cache/
 data/cache/*.parquet
 data/cache/*.pt
 data/cache/*_meta.json
-
 !data/cache/README.md
 
-# folders
-checkpoints
+# Model weights and checkpoints
+models/weights/
+models/checkpoints/
 
+# Folders
+checkpoints
+plots/
+wandb/
+latest-run/

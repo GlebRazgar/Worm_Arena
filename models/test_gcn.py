@@ -46,19 +46,25 @@ class SimpleTestGCN(nn.Module):
         
         Args:
             data: PyG Data object with:
-                - x: [N, 1] current activation
+                - x: [N, 1] or [N, window_size] current activation(s)
                 - edge_index: [2, E] connectome edges
                 - mask: [N, 1] valid neurons (optional)
         
         Returns:
             predictions: [N, 1] predicted next-timestep activation
-                         = x + delta (residual prediction)
+                         = x_t + delta (residual prediction)
         """
-        x = data.x  # [N, 1]
+        x = data.x  # [N, 1] or [N, window_size]
         edge_index = data.edge_index  # [2, E]
         
+        # Handle temporal windows: use last timestep
+        if x.dim() == 2 and x.shape[1] > 1:
+            x_t = x[:, -1:]  # [N, 1] - take last timestep
+        else:
+            x_t = x  # [N, 1]
+        
         # Graph convolution
-        h = self.gcn(x, edge_index)  # [N, hidden_dim]
+        h = self.gcn(x_t, edge_index)  # [N, hidden_dim]
         h = torch.relu(h)
         
         # Predict the CHANGE (delta), not the absolute value
@@ -67,7 +73,7 @@ class SimpleTestGCN(nn.Module):
         # RESIDUAL: Output = Input + Delta
         # This means: if delta=0, we get the naive baseline (X(t+1) = X(t))
         # The model only needs to learn the correction!
-        out = x + delta
+        out = x_t + delta
         
         return out
 
@@ -231,6 +237,160 @@ def compute_naive_baseline(loader, device):
         'r2': r2,
         'correlation': correlation
     }
+
+
+@torch.no_grad()
+def evaluate_multi_horizon(model, df, connectome, device, horizons=[1, 10, 20], max_worms=None, batch_size=128):
+    """
+    Evaluate model at multiple prediction horizons.
+    
+    Creates separate datasets for each horizon and evaluates.
+    
+    Args:
+        model: Model to evaluate
+        df: DataFrame with functional data
+        connectome: Connectome graph
+        device: torch device
+        horizons: List of horizons to evaluate [1, 10, 20]
+        max_worms: Max worms to use
+        batch_size: Batch size for evaluation
+    
+    Returns:
+        dict: {horizon: {mse, mae, rmse, r2, correlation}} for each horizon
+    """
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    from data.preprocessing import load_or_create_dataset
+    from torch_geometric.loader import DataLoader
+    
+    results = {}
+    
+    for horizon in horizons:
+        print(f"   Evaluating horizon t+{horizon}...")
+        # Create dataset for this specific horizon
+        dataset = load_or_create_dataset(
+            df, connectome, 
+            max_worms=max_worms,
+            window_size=1,  # Single timestep input
+            target_horizon=horizon,
+            use_cache=True,
+            verbose=False
+        )
+        
+        if len(dataset) == 0:
+            results[horizon] = {'mse': float('nan'), 'r2': float('nan'), 'mae': float('nan'), 'rmse': float('nan')}
+            continue
+        
+        # Split and use test set
+        _, _, test_ds = dataset.split_by_worm()
+        test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+        
+        # Evaluate model
+        metrics = evaluate(model, test_loader, device)
+        results[horizon] = metrics
+        print(f"      R²: {metrics['r2']:.4f}, MSE: {metrics['mse']:.4f}")
+    
+    return results
+
+
+def compute_naive_baseline_multi_horizon(df, connectome, device, horizons=[1, 10, 20], max_worms=None, batch_size=128):
+    """
+    Compute naive baseline at multiple horizons.
+    
+    For horizon h: X̂(t+h) = X(t) (always predict current state)
+    
+    Args:
+        df: DataFrame with functional data
+        connectome: Connectome graph
+        device: torch device
+        horizons: List of horizons to evaluate
+        max_worms: Max worms to use
+        batch_size: Batch size
+    
+    Returns:
+        dict: {horizon: {mse, mae, rmse, r2, correlation}}
+    """
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    from data.preprocessing import load_or_create_dataset
+    from torch_geometric.loader import DataLoader
+    
+    results = {}
+    
+    for horizon in horizons:
+        print(f"   Computing baseline for horizon t+{horizon}...")
+        # Create dataset for this horizon
+        dataset = load_or_create_dataset(
+            df, connectome,
+            max_worms=max_worms,
+            window_size=1,
+            target_horizon=horizon,
+            use_cache=True,
+            verbose=False
+        )
+        
+        if len(dataset) == 0:
+            results[horizon] = {'mse': float('nan'), 'r2': float('nan'), 'mae': float('nan'), 'rmse': float('nan')}
+            continue
+        
+        _, _, test_ds = dataset.split_by_worm()
+        test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+        
+        all_preds = []
+        all_targets = []
+        
+        for data in test_loader:
+            data = data.to(device)
+            
+            # Naive baseline: always predict X(t) regardless of horizon
+            if data.x.shape[1] == 1:
+                pred = data.x  # [N, 1]
+            else:
+                pred = data.x[:, -1:]  # [N, 1] - last timestep
+            
+            target = data.y  # [N, 1] - this is now t+horizon
+            mask = data.mask.view(-1)
+            
+            all_preds.append(pred.view(-1)[mask == 1].cpu())
+            all_targets.append(target.view(-1)[mask == 1].cpu())
+        
+        if len(all_preds) == 0:
+            results[horizon] = {'mse': float('nan'), 'r2': float('nan')}
+            continue
+        
+        preds = torch.cat(all_preds)
+        targets = torch.cat(all_targets)
+        
+        # Compute metrics
+        mse = torch.mean((preds - targets) ** 2).item()
+        mae = torch.mean(torch.abs(preds - targets)).item()
+        rmse = mse ** 0.5
+        
+        ss_res = torch.sum((targets - preds) ** 2)
+        ss_tot = torch.sum((targets - torch.mean(targets)) ** 2)
+        r2 = (1 - ss_res / ss_tot).item() if ss_tot > 0 else float('nan')
+        
+        if len(preds) > 1:
+            pred_centered = preds - torch.mean(preds)
+            target_centered = targets - torch.mean(targets)
+            correlation = (torch.sum(pred_centered * target_centered) / 
+                          (torch.sqrt(torch.sum(pred_centered ** 2)) * 
+                           torch.sqrt(torch.sum(target_centered ** 2)))).item()
+        else:
+            correlation = float('nan')
+        
+        results[horizon] = {
+            'mse': mse,
+            'mae': mae,
+            'rmse': rmse,
+            'r2': r2,
+            'correlation': correlation
+        }
+        print(f"      R²: {r2:.4f}, MSE: {mse:.4f}")
+    
+    return results
 
 
 if __name__ == "__main__":

@@ -12,20 +12,16 @@ Build a GNN-LSTM hybrid model that uses the C. elegans connectome graph structur
 # The model:
 
 - Prior: Anatomical connectome graph (neurons = nodes, synapse connections = weights of edges).
-    - Format:
 - Input: Functional data (continuous calcium singal)
-    - Format: 
 - Learn: Re-weigting the connectome. Infer spatial relationships that dont exist. Functional weights (which connections matter for dynamics)
-    - 
 - Output: Calcium activity prediction. 
-    - Same as input format
 - Objective: Discover structure-function relationships in the nervous system
 
 ## GNN architecture:
 
 Type: GAT.
 
-Reason: Learns to adjust edge weights via attention. It will take the connectome as a prior, and learn a more correct connectivity from functional data. Incase some links are missing or connection weights dont correspond perfectly to function.
+Reason: Learns the important edge weights via attention. It will take the connectome as a prior, and learn a more correct connectivity from functional data, in cases where connection weights dont correspond perfectly to function.
 
 Adjustments: *Add spatial features to GAT*
 attention_ij = f(neural_features, edge_attr, distance_ij)
@@ -33,7 +29,152 @@ attention_ij = f(neural_features, edge_attr, distance_ij)
 # - attention_ij = learned functional weight (adjustment)
 # - Final weight = attention_ij * edge_attr_ij (combines both)
 
+## Detailed Model Architecture
 
+### Overall Structure: GAT-LSTM Hybrid
+
+The model processes graph-temporal data in two stages:
+1. **Spatial Processing (GAT)**: At each timestep, GAT layers aggregate information from neighboring neurons
+2. **Temporal Processing (LSTM)**: LSTM processes the sequence of spatial embeddings to capture dynamics
+
+### Forward Pass Flow
+
+```
+Input: x = [batch, window_size=50, num_neurons=236, features=1]
+       edge_index = [2, 4085]
+       edge_attr = [4085, 2]  # [gap_weight, chem_weight]
+
+For each timestep t in window:
+    x_t = x[:, t, :, :]  # [batch, 236, 1]
+    
+    # GAT Layer 1: 1 -> 64, 4 heads
+    h1 = GATLayer1(x_t, edge_index, edge_attr)  # [batch, 236, 64]
+    
+    # GAT Layer 2: 64 -> 128, 4 heads
+    h2 = GATLayer2(h1, edge_index, edge_attr)  # [batch, 236, 128]
+    
+    # GAT Layer 3: 128 -> 256, 2 heads
+    h3 = GATLayer3(h2, edge_index, edge_attr)  # [batch, 236, 256]
+    
+    spatial_embeddings[t] = h3  # Store for LSTM
+
+# Stack all timesteps: [batch, 50, 236, 256]
+spatial_sequence = stack(spatial_embeddings)
+
+# Reshape for LSTM: [batch*236, 50, 256]
+# Process each neuron's temporal sequence independently
+spatial_sequence = spatial_sequence.view(batch*236, 50, 256)
+
+# LSTM: 256 hidden, 2 layers
+lstm_out, (h_n, c_n) = LSTM(spatial_sequence)  # [batch*236, 50, 256]
+final_hidden = lstm_out[:, -1, :]  # [batch*236, 256] - last timestep
+
+# Reshape back: [batch, 236, 256]
+final_hidden = final_hidden.view(batch, 236, 256)
+
+# MLP Prediction Head: 256 -> 128 -> 1
+predictions = MLP(final_hidden)  # [batch, 236, 1]
+
+Output: [batch, 236, 1] - predicted calcium activity for next timestep
+```
+
+### GAT Layer Architecture
+
+Each GAT layer implements multi-head attention with edge features:
+
+```python
+class GATLayer(MessagePassing):
+    """
+    Graph Attention Layer with edge features.
+    
+    Attention mechanism:
+    - Computes attention scores from node features + edge attributes
+    - Multi-head attention (4 heads for layers 1-2, 2 heads for layer 3)
+    - Handles directed edges (chemical synapses) and bidirectional (gap junctions)
+    """
+    
+    def forward(x, edge_index, edge_attr):
+        # x: [N, in_features]
+        # edge_index: [2, E]
+        # edge_attr: [E, 2]  # [gap_weight, chem_weight]
+        
+        # Compute attention scores
+        # alpha_ij = softmax(LeakyReLU(a^T [Wx_i || Wx_j || edge_attr_ij]))
+        # where || is concatenation
+        
+        # Aggregate messages with attention weights
+        # h_i = sum_j(alpha_ij * Wx_j)
+        
+        # Concatenate multi-head outputs
+        # output = [head1 || head2 || ... || headK]
+        
+        return output  # [N, out_features]
+```
+
+**Key Features:**
+- **Edge-aware attention**: Incorporates `edge_attr` (gap + chem weights) into attention computation
+- **Multi-head mechanism**: Captures different types of relationships (4 heads → 2 heads)
+- **Residual connections**: Optional skip connections between layers
+- **Layer normalization**: Stabilizes training
+
+### LSTM Architecture
+
+```python
+LSTM(
+    input_size=256,      # GAT output dimension
+    hidden_size=256,     # Hidden state dimension
+    num_layers=2,        # Stacked LSTM layers
+    dropout=0.2,         # Dropout between layers
+    batch_first=True     # Input format: [batch, seq, features]
+)
+```
+
+**Design Choice: Per-neuron LSTM**
+- Each neuron's temporal sequence processed independently
+- Allows neurons to have different temporal dynamics
+- More interpretable than shared LSTM
+
+### Prediction Head
+
+```python
+MLP(
+    Linear(256, 128),
+    ReLU(),
+    Dropout(0.1),
+    Linear(128, 1)  # Single output: predicted calcium activity
+)
+```
+
+### Loss Function
+
+**Masked MSE Loss:**
+```python
+loss = MSE(predictions[mask==1], targets[mask==1])
+```
+- Only computes loss on recorded neurons
+- Handles missing data gracefully
+
+### Total Architecture Summary
+
+- **Input**: [batch, 50, 236, 1] - 50 timesteps × 236 neurons × 1 feature
+- **GAT Layers**: 3 layers, progressively increasing channels (1→64→128→256)
+- **LSTM**: 2 layers, 256 hidden units, processes 50-timestep sequences
+- **Output**: [batch, 236, 1] - predicted next-timestep activity
+- **Parameters**: ~5-8M total
+- **Memory**: ~2-4 GB per batch (MPS optimized)
+
+### Attention Weight Extraction
+
+For visualization, extract attention weights from each GAT layer:
+```python
+# During forward pass, store attention weights
+attention_weights = {
+    'layer1': [batch, E, 4],  # 4 heads
+    'layer2': [batch, E, 4],
+    'layer3': [batch, E, 2]   # 2 heads
+}
+```
+These can be averaged across heads and visualized on the connectome graph.
 
 ## Graph Properties
 
@@ -57,10 +198,9 @@ From the code:
 
 1. Calcium activity of each neuorn. 
 2. Basdeline models validation loss across datasets.
-3. GNNs validation loss across datasets.
-4. GNN validation curve throutghout epochs for each individual dataset. 
-5. Visualisation of the models outputs as a connectome graph of a worm passing the message, ligting up, lighting down, etc.
-6. GPU utilizartion plot on weights and biases live tracked. 
+3. GATs validation loss across datasets.
+4. GATs validation curve throutghout epochs for each individual dataset (using weights and biases.). 
+5. Visualisation of the models outputs as a connectome graph of a worm passing the message, ligting up, lighting down, etc. (we can leave that for later)
 
 ## Files to Modify/Create
 
@@ -76,9 +216,9 @@ From the code:
 - Add device config: "mps" (primary), "cpu" (fallback)
 - Add data config: batch_size=16, num_workers=4
 
-### 2. models/gnn.py (CREATE - ~400 lines)
+### 2. models/gat.py (CREATE - ~400 lines)
 
-Complete GNN-LSTM implementation in single file:
+Complete GAT-LSTM implementation in single file:
 
 **Part A: Data Preparation (150 lines)**
 
@@ -89,6 +229,7 @@ Complete GNN-LSTM implementation in single file:
 - Create mask [T, N] for missing neurons
 - Extract sliding windows [W, N]
 - Return List[Data] with x=[W,N,1], edge_index, edge_attr, mask, y=[N]
+- (you might have already done this for other models)
 
 - `WormGraphDataset(Dataset)`:
 - PyTorch Dataset wrapper
@@ -97,7 +238,7 @@ Complete GNN-LSTM implementation in single file:
 
 **Part B: Model Architecture (250 lines)**
 
-- `BioGATLayer(MessagePassing)`:
+- `GATLayer(MessagePassing)`:
 - GAT with edge features (2D: gap junction + chemical weights)
 - Multi-head attention mechanism
 - Handles directed edges (chemical synapses)

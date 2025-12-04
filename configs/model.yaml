@@ -1,11 +1,80 @@
-# Define architecture choices.
+# Model Configuration
 
-# Simple GCN Test Model
+# Device priority: MPS (Apple Silicon) > CUDA > CPU
+device: "auto"  # Will auto-detect: mps > cuda > cpu
+
+# =============================================================================
+# Simple GCN Test Model (for quick testing)
+# =============================================================================
 simple_gcn:
   hidden_dim: 32
   epochs: 100
   batch_size: 32
   lr: 0.001
+
+# =============================================================================
+# GAT-LSTM Model (Main Model) - ULTRA OPTIMIZED FOR 36GB RAM
+# =============================================================================
+gat_lstm:
+  # GAT Architecture (minimal for speed)
+  gat:
+    in_channels: 1                  # Input feature dimension (calcium activity)
+    hidden_channels: [32]           # SINGLE layer for speed
+    heads: [2]                      # Reduced heads
+    edge_dim: 2                     # Edge feature dimension (gap + chem)
+    dropout: 0.0                    # No dropout for speed
+    add_self_loops: true            # Add self-loops to graph
+    negative_slope: 0.2             # LeakyReLU negative slope
+  
+  # LSTM Architecture (minimal)
+  lstm:
+    hidden_size: 32                 # Reduced for memory
+    num_layers: 1                   # Single layer
+    dropout: 0.0                    # No dropout
+    bidirectional: false            # Unidirectional
+  
+  # Prediction Head
+  predictor:
+    hidden_dims: [16]               # Minimal
+    dropout: 0.0                    # No dropout
+  
+  # Residual Connection
+  residual: true                    # IMPORTANT: keeps baseline performance
+  
+  # Optimization flags
+  use_vectorized: true              # Use vectorized forward pass
+
+# =============================================================================
+# Training Configuration - ULTRA OPTIMIZED FOR 36GB RAM
+# =============================================================================
+training:
+  # Data (MINIMAL for 36GB unified memory)
+  window_size: 5                    # Minimal window
+  stride: 5                         # Same as window (no overlap)
+  batch_size: 32                    # Smaller batch to avoid swap
+  max_worms: 5                      # 5 worms = ~33K samples, fits in RAM
+  
+  # Optimization
+  lr: 0.001                         # Learning rate
+  weight_decay: 0.0001              # L2 regularization
+  epochs: 100                       # Maximum epochs
+  patience: 15                      # Early stopping patience
+  
+  # Checkpointing
+  save_every: 10                    # Save checkpoint every N epochs
+  checkpoint_dir: "models/checkpoints"
+  weights_dir: "models/weights"
+  
+  # Logging
+  log_every: 1                      # Log every N epochs
+  use_wandb: false                  # Use Weights & Biases logging
+
+# =============================================================================
+# Evaluation
+# =============================================================================
+evaluation:
+  horizons: [1, 10, 20]             # Prediction horizons to evaluate
+  metrics: ["mse", "mae", "rmse", "r2", "correlation"]
 
 # Full GNN-LSTM Model (for future use)
 # model_type: gnn
