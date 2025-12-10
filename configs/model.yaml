@@ -22,7 +22,7 @@ gat_lstm:
     hidden_channels: [32]           # SINGLE layer for speed
     heads: [2]                      # Reduced heads
     edge_dim: 2                     # Edge feature dimension (gap + chem)
-    dropout: 0.0                    # No dropout for speed
+    dropout: 0.2                    # No dropout for speed
     add_self_loops: true            # Add self-loops to graph
     negative_slope: 0.2             # LeakyReLU negative slope
   
@@ -30,13 +30,13 @@ gat_lstm:
   lstm:
     hidden_size: 32                 # Reduced for memory
     num_layers: 1                   # Single layer
-    dropout: 0.0                    # No dropout
+    dropout: 0.2                    # No dropout
     bidirectional: false            # Unidirectional
   
   # Prediction Head
   predictor:
     hidden_dims: [16]               # Minimal
-    dropout: 0.0                    # No dropout
+    dropout: 0.2                    # No dropout
   
   # Residual Connection
   residual: true                    # IMPORTANT: keeps baseline performance
