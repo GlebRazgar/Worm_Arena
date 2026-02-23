@@ -1,14 +1,14 @@
 """
-Training Pipeline for Autoregressive GAT-LSTM Model
+Training Pipeline for GAT-LSTM Model
 
-Trains GAT-LSTM with autoregressive rollout loss on C. elegans neural activity.
-Default training objective predicts t+10 by unrolling local t+1 dynamics.
+Trains the GAT-LSTM model on C. elegans neural activity data.
+Optimized for MPS (Apple Silicon) acceleration.
 Includes optional Weights & Biases integration.
 
 Usage:
-    python src/train.py --epochs 100 --wandb
-    python src/train.py --target-horizon 10 --amp --wandb
-    python src/train.py --target-horizon 1  # fallback to t+1 objective
+    python src/train.py --model gat --epochs 50 --batch-size 64
+    python src/train.py --model gat --epochs 50 --wandb  # With W&B logging
+    python src/train.py --model gcn --epochs 20  # For simple GCN baseline
 """
 
 import sys
@@ -21,9 +21,9 @@ import yaml
 import random
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.optim as optim
 from torch_geometric.loader import DataLoader
-from torch_geometric.data import Data
 from tqdm import tqdm
 
 
@@ -49,23 +49,24 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from data.connectomes.connectome_loader import load_connectome
 from data.functional.functional_loader import load_functional_data
-from data.preprocessing import load_or_create_rollout_dataset
-from models.gat import GATLSTM, masked_mse_loss
+from data.preprocessing import load_or_create_dataset, WormGraphDataset
+from models.gat import GATLSTM, masked_mse_loss, create_gat_lstm_model
+from models.test_gcn import SimpleTestGCN
 
 
 def setup_device():
     """
-    Setup compute device with priority: CUDA > MPS > CPU.
+    Setup compute device with priority: MPS > CUDA > CPU.
     
     Returns:
         torch.device
     """
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-        print(f"Using CUDA: {torch.cuda.get_device_name(0)}")
-    elif torch.backends.mps.is_available():
+    if torch.backends.mps.is_available():
         device = torch.device("mps")
         print("Using MPS (Apple Silicon GPU)")
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+        print(f"Using CUDA: {torch.cuda.get_device_name(0)}")
     else:
         device = torch.device("cpu")
         print("Using CPU")
@@ -115,190 +116,190 @@ def get_weight_filename(model_name):
         return f"{name.replace(' ', '_')}_model_weights.pt"
 
 
-def _compute_metrics(preds, targets):
-    """Compute scalar metrics from flattened tensors."""
-    mse = torch.mean((preds - targets) ** 2).item()
-    mae = torch.mean(torch.abs(preds - targets)).item()
-    rmse = mse ** 0.5
-
-    ss_res = torch.sum((targets - preds) ** 2)
-    ss_tot = torch.sum((targets - torch.mean(targets)) ** 2)
-    r2 = (1 - ss_res / ss_tot).item() if ss_tot > 0 else float('nan')
-
-    if len(preds) > 1:
-        pred_centered = preds - torch.mean(preds)
-        target_centered = targets - torch.mean(targets)
-        correlation = (
-            torch.sum(pred_centered * target_centered) /
-            (torch.sqrt(torch.sum(pred_centered ** 2)) * torch.sqrt(torch.sum(target_centered ** 2)))
-        ).item()
-    else:
-        correlation = float('nan')
-
-    return {'mse': mse, 'mae': mae, 'rmse': rmse, 'r2': r2, 'correlation': correlation}
-
-
-def rollout_forward(model, batch, rollout_steps):
-    """
-    Autoregressive rollout from x(t-window+1:t) to x(t+rollout_steps).
-
-    Returns:
-        step_losses: list[Tensor] one masked loss per rollout step
-        final_pred: Tensor [N, 1] prediction at final horizon
-    """
-    window = batch.x
-    step_losses = []
-    final_pred = None
-
-    for step in range(rollout_steps):
-        step_data = Data(x=window, edge_index=batch.edge_index, edge_attr=batch.edge_attr)
-        pred = model(step_data)
-        target_step = batch.y_rollout[:, step:step + 1]
-        step_mask = batch.mask * batch.mask_rollout[:, step:step + 1]
-        step_loss = masked_mse_loss(pred, target_step, step_mask)
-        step_losses.append(step_loss)
-        final_pred = pred
-
-        # Feed prediction back into the temporal window.
-        if window.shape[1] > 1:
-            window = torch.cat([window[:, 1:], pred], dim=1)
-        else:
-            window = pred
-
-    return step_losses, final_pred
-
-
 @torch.no_grad()
-def evaluate(model, loader, device, rollout_steps):
-    """Evaluate autoregressive rollout model at the final target horizon."""
+def evaluate(model, loader, device):
+    """
+    Evaluate model on a data loader.
+    
+    Args:
+        model: Model to evaluate
+        loader: DataLoader
+        device: torch device
+    
+    Returns:
+        dict: Metrics (mse, mae, rmse, r2, correlation)
+    """
     model.eval()
-
+    
     all_preds = []
     all_targets = []
     total_loss = 0.0
     num_batches = 0
-
+    
     for data in loader:
         data = data.to(device)
-        step_losses, final_pred = rollout_forward(model, data, rollout_steps=rollout_steps)
-        loss = torch.stack(step_losses).mean()
+        
+        pred = model(data)
+        loss = masked_mse_loss(pred, data.y, data.mask)
         total_loss += loss.item()
         num_batches += 1
-
+        
         mask = data.mask.view(-1)
-        all_preds.append(final_pred.view(-1)[mask == 1].cpu())
+        all_preds.append(pred.view(-1)[mask == 1].cpu())
         all_targets.append(data.y.view(-1)[mask == 1].cpu())
-
+    
     if num_batches == 0:
         return {
-            'mse': float('nan'),
+            'mse': float('nan'), 
             'mae': float('nan'),
             'rmse': float('nan'),
-            'r2': float('nan'),
+            'r2': float('nan'), 
             'correlation': float('nan'),
             'avg_loss': float('nan')
         }
-
+    
     preds = torch.cat(all_preds)
     targets = torch.cat(all_targets)
-    metrics = _compute_metrics(preds, targets)
-    metrics['avg_loss'] = total_loss / num_batches
-    return metrics
+    
+    # Compute metrics
+    mse = torch.mean((preds - targets) ** 2).item()
+    mae = torch.mean(torch.abs(preds - targets)).item()
+    rmse = mse ** 0.5
+    
+    ss_res = torch.sum((targets - preds) ** 2)
+    ss_tot = torch.sum((targets - torch.mean(targets)) ** 2)
+    r2 = (1 - ss_res / ss_tot).item() if ss_tot > 0 else float('nan')
+    
+    if len(preds) > 1:
+        pred_centered = preds - torch.mean(preds)
+        target_centered = targets - torch.mean(targets)
+        correlation = (torch.sum(pred_centered * target_centered) / 
+                      (torch.sqrt(torch.sum(pred_centered ** 2)) * 
+                       torch.sqrt(torch.sum(target_centered ** 2)))).item()
+    else:
+        correlation = float('nan')
+    
+    return {
+        'mse': mse,
+        'mae': mae,
+        'rmse': rmse,
+        'r2': r2,
+        'correlation': correlation,
+        'avg_loss': total_loss / num_batches
+    }
 
 
 @torch.no_grad()
 def compute_naive_baseline(loader, device):
     """
-    Compute naive baseline metrics at the final horizon:
-    X_hat(t+h) = X(t), where h is the rollout horizon.
+    Compute naive baseline metrics (X̂(t+1) = X(t)).
     """
     all_preds = []
     all_targets = []
-
+    
     for data in loader:
         data = data.to(device)
-        pred = data.x[:, -1:] if data.x.dim() == 2 and data.x.shape[1] > 1 else data.x
+        
+        # Naive: predict last timestep of window
+        if data.x.dim() == 2 and data.x.shape[1] > 1:
+            pred = data.x[:, -1:]
+        else:
+            pred = data.x
+        
         mask = data.mask.view(-1)
         all_preds.append(pred.view(-1)[mask == 1].cpu())
         all_targets.append(data.y.view(-1)[mask == 1].cpu())
-
+    
     preds = torch.cat(all_preds)
     targets = torch.cat(all_targets)
-    return _compute_metrics(preds, targets)
+    
+    mse = torch.mean((preds - targets) ** 2).item()
+    mae = torch.mean(torch.abs(preds - targets)).item()
+    rmse = mse ** 0.5
+    
+    ss_res = torch.sum((targets - preds) ** 2)
+    ss_tot = torch.sum((targets - torch.mean(targets)) ** 2)
+    r2 = (1 - ss_res / ss_tot).item() if ss_tot > 0 else float('nan')
+    
+    if len(preds) > 1:
+        pred_centered = preds - torch.mean(preds)
+        target_centered = targets - torch.mean(targets)
+        correlation = (torch.sum(pred_centered * target_centered) / 
+                      (torch.sqrt(torch.sum(pred_centered ** 2)) * 
+                       torch.sqrt(torch.sum(target_centered ** 2)))).item()
+    else:
+        correlation = float('nan')
+    
+    return {'mse': mse, 'mae': mae, 'rmse': rmse, 'r2': r2, 'correlation': correlation}
 
 
-def train_epoch(model, loader, optimizer, device, rollout_steps, use_amp=False, scaler=None, pbar=None):
-    """Train one epoch with autoregressive rollout loss."""
+def train_epoch(model, loader, optimizer, device, pbar=None):
+    """
+    Train for one epoch.
+    
+    Args:
+        model: Model to train
+        loader: DataLoader
+        optimizer: Optimizer
+        device: torch device
+        pbar: Optional progress bar
+    
+    Returns:
+        float: Average loss
+    """
     model.train()
     total_loss = 0.0
     num_batches = 0
-
+    
     for data in loader:
         data = data.to(device)
-        optimizer.zero_grad(set_to_none=True)
-
-        if use_amp:
-            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                step_losses, _ = rollout_forward(model, data, rollout_steps=rollout_steps)
-                loss = torch.stack(step_losses).mean()
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            step_losses, _ = rollout_forward(model, data, rollout_steps=rollout_steps)
-            loss = torch.stack(step_losses).mean()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-
+        
+        optimizer.zero_grad()
+        pred = model(data)
+        loss = masked_mse_loss(pred, data.y, data.mask)
+        loss.backward()
+        
+        # Gradient clipping
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        
+        optimizer.step()
+        
         total_loss += loss.item()
         num_batches += 1
-
+        
         if pbar is not None:
             pbar.set_postfix({'loss': f'{loss.item():.4f}'})
             pbar.update(1)
-
+    
     return total_loss / max(num_batches, 1)
 
 
 def train_gat_model(args):
     """
-    Main training function for autoregressive GAT-LSTM rollout training.
-    Defaults to target_horizon=10 (option D), can switch to t+1 via flag.
+    Main training function for GAT-LSTM model.
+    OPTIMIZED for M4 Max with limited memory.
     """
     # Set seeds for reproducibility
     set_seed(42)
     
     print("=" * 70)
-    print("GAT-LSTM AUTOREGRESSIVE TRAINING")
+    print("GAT-LSTM MODEL TRAINING (OPTIMIZED)")
     print("=" * 70)
     
     # Setup device
     device = setup_device()
-    use_amp = device.type == "cuda" and not args.no_amp
-    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
     
     # Load config
-    config = load_config(args.config)
-    model_section = args.config_model or 'gat_lstm_a100'
-    train_section = args.config_training or 'training_a100'
-    gat_config = config.get(model_section, config.get('gat_lstm', {}))
-    train_config = config.get(train_section, config.get('training', {}))
+    config = load_config()
+    gat_config = config.get('gat_lstm', {})
+    train_config = config.get('training', {})
     
-    # --rollout-steps is an alias for --target-horizon; CLI takes precedence over config
-    cli_horizon = args.rollout_steps if args.rollout_steps is not None else args.target_horizon
-    
-    # Override with args
-    window_size = args.window_size if args.window_size is not None else train_config.get('window_size', 10)
-    batch_size = args.batch_size if args.batch_size is not None else train_config.get('batch_size', 256)
-    epochs = args.epochs if args.epochs is not None else train_config.get('epochs', 100)
-    lr = args.lr if args.lr is not None else train_config.get('lr', 0.001)
-    max_worms = args.max_worms if args.max_worms is not None else train_config.get('max_worms', None)
-    num_workers = args.num_workers if args.num_workers is not None else train_config.get('num_workers', 4)
-    target_horizon = cli_horizon if cli_horizon is not None else train_config.get('target_horizon', 10)
-    pin_memory = bool(device.type == "cuda")
+    # Override with args (ULTRA optimized for 36GB RAM - NO SWAP)
+    window_size = args.window_size or train_config.get('window_size', 5)    # Minimal
+    batch_size = args.batch_size or train_config.get('batch_size', 32)      # Small to avoid swap
+    epochs = args.epochs or train_config.get('epochs', 100)
+    lr = args.lr or train_config.get('lr', 0.001)
+    max_worms = args.max_worms or train_config.get('max_worms', 5)          # ~33K samples, fits in RAM
     
     # Load data
     print(f"\n1. Loading data...")
@@ -312,14 +313,14 @@ def train_gat_model(args):
     print(f"   Data loaded in {time.time() - t_start:.2f}s")
     
     # Create dataset
-    print(f"\n2. Creating graph-rollout dataset...")
+    print(f"\n2. Creating graph-temporal dataset...")
     t_data = time.time()
     
-    dataset = load_or_create_rollout_dataset(
+    dataset = load_or_create_dataset(
         df, connectome,
         max_worms=max_worms,
         window_size=window_size,
-        rollout_steps=target_horizon,
+        target_horizon=1,
         use_cache=True,
         verbose=True
     )
@@ -333,12 +334,14 @@ def train_gat_model(args):
     print(f"   Val:   {len(val_ds)} samples")
     print(f"   Test:  {len(test_ds)} samples")
     
-    # Create loaders with CUDA-friendly settings
+    # Create loaders with optimized settings
+    # Use larger batch size for validation (no gradients needed)
+    # Use generator for reproducible shuffling
     g = torch.Generator()
     g.manual_seed(42)
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory, generator=g)
-    val_loader = DataLoader(val_ds, batch_size=batch_size * 2, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
-    test_loader = DataLoader(test_ds, batch_size=batch_size * 2, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=False, generator=g)
+    val_loader = DataLoader(val_ds, batch_size=batch_size * 2, shuffle=False, num_workers=0, pin_memory=False)
+    test_loader = DataLoader(test_ds, batch_size=batch_size * 2, shuffle=False, num_workers=0, pin_memory=False)
     
     print(f"   Batches per epoch: {len(train_loader)}")
     
@@ -346,21 +349,16 @@ def train_gat_model(args):
     print(f"\n4. Initializing GAT-LSTM model...")
     model = GATLSTM(config=gat_config)
     model = model.to(device)
-    model_name = "GATLSTM-rollout"
-    weight_filename = "gat_lstm_model_weights.pt"
+    model_name = "GATLSTM"
+    weight_filename = get_weight_filename(model_name)
     
     print(f"   {model_name} with {model.num_params:,} parameters")
     print(f"   GAT layers: {model.gat_hidden}")
     print(f"   GAT heads: {model.gat_heads}")
     print(f"   LSTM hidden: {model.lstm_hidden}, layers: {model.lstm_layers}")
     print(f"   Window size: {window_size}")
-    print(f"   Target horizon: t+{target_horizon}")
     print(f"   Residual: {model.residual}")
     print(f"   Vectorized: {model.use_vectorized}")
-    print(f"   Model config: {model_section}")
-    print(f"   Training config: {train_section}")
-    print(f"   Num workers: {num_workers}, pin_memory={pin_memory}")
-    print(f"   AMP enabled: {use_amp}")
     
     # Optimizer
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=train_config.get('weight_decay', 1e-4))
@@ -379,9 +377,9 @@ def train_gat_model(args):
         else:
             wandb.init(
                 project=args.wandb_project,
-                name=args.wandb_name or f"gat-rollout-h{target_horizon}-w{window_size}-b{batch_size}",
+                name=args.wandb_name or f"gat-lstm-w{window_size}-b{batch_size}",
                 config={
-                    "model": "GAT-LSTM-rollout",
+                    "model": "GAT-LSTM",
                     "gat_hidden": model.gat_hidden,
                     "gat_heads": model.gat_heads,
                     "lstm_hidden": model.lstm_hidden,
@@ -392,9 +390,6 @@ def train_gat_model(args):
                     "epochs": epochs,
                     "lr": lr,
                     "max_worms": max_worms,
-                    "target_horizon": target_horizon,
-                    "num_workers": num_workers,
-                    "amp": use_amp,
                     "baseline_r2": baseline['r2'],
                     "baseline_mse": baseline['mse'],
                 }
@@ -409,6 +404,7 @@ def train_gat_model(args):
     
     # Training loop
     print(f"\n6. Training for {epochs} epochs...")
+    print(f"   Estimated time per epoch: ~{len(train_loader) * 0.05:.0f}s ({len(train_loader) * 0.05 / 60:.1f} min)")
     print("-" * 70)
     
     best_val_loss = float('inf')
@@ -433,37 +429,19 @@ def train_gat_model(args):
         # Train
         batch_pbar = tqdm(total=len(train_loader), desc=f"  Epoch {epoch+1}", 
                          position=1, leave=False, ncols=80)
-        train_loss = train_epoch(
-            model=model,
-            loader=train_loader,
-            optimizer=optimizer,
-            device=device,
-            rollout_steps=target_horizon,
-            use_amp=use_amp,
-            scaler=scaler,
-            pbar=batch_pbar
-        )
+        train_loss = train_epoch(model, train_loader, optimizer, device, pbar=batch_pbar)
         batch_pbar.close()
         
         train_time = time.time() - t_epoch
         
         # Validate
         t_val = time.time()
-        val_metrics = evaluate(model, val_loader, device, rollout_steps=target_horizon)
+        val_metrics = evaluate(model, val_loader, device)
         val_time = time.time() - t_val
         val_loss = val_metrics['avg_loss']
         val_r2 = val_metrics['r2']
         
         epoch_time = time.time() - t_epoch
-        
-        # After first epoch, print time estimate for the full run
-        if epoch == 0:
-            remaining = epoch_time * (epochs - 1)
-            tqdm.write(
-                f"   First epoch: {epoch_time:.1f}s "
-                f"(train {train_time:.1f}s + val {val_time:.1f}s) | "
-                f"Estimated total: ~{epoch_time * epochs / 60:.0f} min"
-            )
         
         # Update scheduler
         scheduler.step(val_loss)
@@ -503,8 +481,7 @@ def train_gat_model(args):
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_loss': val_loss,
                 'val_r2': val_r2,
-                'config': gat_config,
-                'target_horizon': target_horizon
+                'config': gat_config
             }, checkpoint_dir / "gat_lstm_best.pt")
         else:
             patience_counter += 1
@@ -520,14 +497,12 @@ def train_gat_model(args):
             'time': f'{epoch_time:.1f}s'
         })
         
-        # Log every epoch with persistent line
-        best_marker = " *" if val_loss <= best_val_loss else ""
-        tqdm.write(
-            f"Epoch {epoch+1:3d}/{epochs} | "
-            f"Train: {train_loss:.4f} | Val: {val_loss:.4f} | "
-            f"R²: {val_r2:.4f} | LR: {optimizer.param_groups[0]['lr']:.1e} | "
-            f"{epoch_time:.1f}s{best_marker}"
-        )
+        # Log every 10 epochs
+        if (epoch + 1) % 10 == 0:
+            tqdm.write(
+                f"Epoch {epoch+1:3d}/{epochs} | Train: {train_loss:.4f} ({train_time:.1f}s) | "
+                f"Val: {val_loss:.4f} ({val_time:.1f}s) | R²: {val_r2:.4f} | Total: {epoch_time:.1f}s"
+            )
         
         # Early stopping
         if patience_counter >= patience:
@@ -550,7 +525,7 @@ def train_gat_model(args):
     checkpoint = torch.load(checkpoint_dir / "gat_lstm_best.pt", weights_only=False)
     model.load_state_dict(checkpoint['model_state_dict'])
     
-    test_metrics = evaluate(model, test_loader, device, rollout_steps=target_horizon)
+    test_metrics = evaluate(model, test_loader, device)
     
     print(f"\n   {'Metric':<12} {'GAT-LSTM':<12} {'Naive':<12} {'Improvement':<12}")
     print(f"   {'-'*48}")
@@ -580,10 +555,7 @@ def train_gat_model(args):
             'batch_size': batch_size,
             'epochs': epochs,
             'lr': lr,
-            'max_worms': max_worms,
-            'target_horizon': target_horizon,
-            'num_workers': num_workers,
-            'amp': use_amp
+            'max_worms': max_worms
         },
         'history': history
     }
@@ -620,23 +592,16 @@ def train_gat_model(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train autoregressive GAT-LSTM model")
+    parser = argparse.ArgumentParser(description="Train GAT-LSTM or GCN Model")
+    parser.add_argument('--model', type=str, default='gat', choices=['gat', 'gcn'],
+                        help='Model type: gat (GAT-LSTM) or gcn (SimpleTestGCN)')
     parser.add_argument('--epochs', type=int, default=None, help='Number of epochs')
     parser.add_argument('--batch-size', type=int, default=None, help='Batch size')
     parser.add_argument('--lr', type=float, default=None, help='Learning rate')
     parser.add_argument('--window-size', type=int, default=None, help='Temporal window size')
     parser.add_argument('--max-worms', type=int, default=None, help='Max worms to use')
-    parser.add_argument('--rollout-steps', type=int, default=None,
-                        help='Autoregressive rollout horizon (alias for --target-horizon)')
-    parser.add_argument('--target-horizon', type=int, default=None,
-                        help='Autoregressive rollout horizon. Default from config (10).')
-    parser.add_argument('--num-workers', type=int, default=None, help='DataLoader workers')
-    parser.add_argument('--no-amp', action='store_true', help='Disable mixed precision (enabled by default on CUDA)')
-    parser.add_argument('--config', type=str, default=None, help='Path to model.yaml file')
-    parser.add_argument('--config-model', type=str, default=None,
-                        help='Model config section in YAML (e.g. gat_lstm, gat_lstm_a100)')
-    parser.add_argument('--config-training', type=str, default=None,
-                        help='Training config section in YAML (e.g. training, training_a100)')
+    parser.add_argument('--config', type=str, default=None, help='Path to config file')
+    parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume from')
     
     # Weights & Biases
     parser.add_argument('--wandb', action='store_true', help='Enable Weights & Biases logging')
@@ -644,7 +609,13 @@ def main():
     parser.add_argument('--wandb-name', type=str, default=None, help='W&B run name')
     
     args = parser.parse_args()
-    train_gat_model(args)
+    
+    if args.model == 'gat':
+        train_gat_model(args)
+    else:
+        # Redirect to existing GCN training
+        print("For GCN training, use: python src/train_test_gcn.py")
+        print("This script is for GAT-LSTM training.")
 
 
 if __name__ == "__main__":

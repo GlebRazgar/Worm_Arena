@@ -70,6 +70,53 @@ training:
   use_wandb: false                  # Use Weights & Biases logging
 
 # =============================================================================
+# A100 Configuration (default for new train.py)
+# =============================================================================
+gat_lstm_a100:
+  gat:
+    in_channels: 1
+    hidden_channels: [128, 128]     # Deeper spatial model for CUDA
+    heads: [4, 4]
+    edge_dim: 2
+    dropout: 0.2
+    add_self_loops: true
+    negative_slope: 0.2
+
+  lstm:
+    hidden_size: 128
+    num_layers: 2
+    dropout: 0.2
+    bidirectional: false
+
+  predictor:
+    hidden_dims: [64, 32]
+    dropout: 0.2
+
+  residual: true
+  use_vectorized: true
+
+training_a100:
+  # Data
+  window_size: 10
+  batch_size: 256
+  max_worms: null                   # Use all worms
+  num_workers: 4
+  target_horizon: 10                # Default rollout horizon (Option D)
+
+  # Optimization
+  lr: 0.003
+  weight_decay: 0.0001
+  epochs: 150
+  patience: 25
+
+  # Logging/checkpointing
+  save_every: 10
+  checkpoint_dir: "models/checkpoints"
+  weights_dir: "models/weights"
+  log_every: 1
+  use_wandb: true
+
+# =============================================================================
 # Evaluation
 # =============================================================================
 evaluation:
